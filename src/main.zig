@@ -1,25 +1,28 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+// Store program memory in an array.
+const MEMORY: [vm.MEMORY_MAX]u16 = undefined;
 
-const vm = @import("vm");
+// Store register values in an array.
+const PC_START = 0x3000;
+
+const RegisterList = [vm.NumRegisters]u16;
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    std.debug.print("memory length={d}", .{vm.MEMORY.len});
+    // TODO: load CLI arguments here
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    var reg = Registers.init();
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    const running = true;
+    while (running) {
+        reg.inc_program_counter();
 
-    try bw.flush(); // Don't forget to flush!
+        // TODO: mem_read()
+        const instr = 1;
+
+        // Handle the instruction.
+        _ = instr >> 12;
+    }
 }
+
 
 test "simple test" {
     var list = std.ArrayList(i32).init(std.testing.allocator);
@@ -47,3 +50,8 @@ const std = @import("std");
 
 /// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
 const lib = @import("vm_lib");
+const vm = @import("vm");
+
+const Opcode = vm.Opcode;
+const Register = vm.Register;
+const Registers = vm.Registers;
