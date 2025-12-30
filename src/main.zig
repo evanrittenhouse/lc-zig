@@ -1,57 +1,81 @@
-// Store program memory in an array.
-const MEMORY: [vm.MEMORY_MAX]u16 = undefined;
-
-// Store register values in an array.
-const PC_START = 0x3000;
-
-const RegisterList = [vm.NumRegisters]u16;
+// TODO:
+// 1. SIGINT handling doesn't work
+// 2. move traps to separate struct that takes pointers (?)
+// 3. tests
+// --------------
+// 4. make args processing better
+// 5. propagate error handling better from VM code
+// 6. make byte reading way better. see example for bit casting
 
 pub fn main() !void {
-    // TODO: load CLI arguments here
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    var reg = Registers.init();
-
-    const running = true;
-    while (running) {
-        reg.inc_program_counter();
-
-        // TODO: mem_read()
-        const instr = 1;
-
-        // Handle the instruction.
-        _ = instr >> 12;
-    }
-}
-
-
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "use other module" {
-    try std.testing.expectEqual(@as(i32, 150), lib.add(100, 50));
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
+    const args = std.process.argsAlloc(allocator) catch |err| {
+        std.debug.print("Error getting arguments: {s}\n", .{@errorName(err)});
+        return err;
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    defer std.process.argsFree(allocator, args);
+    if (args.len == 0) {
+        std.debug.print("lc3 [image-file1] ...\n", .{});
+        std.process.exit(2);
+    }
+
+    var orig_tio: c.termios = undefined;
+    disable_input_buffering(&orig_tio);
+    register_sigint_handler();
+
+    var vm = Vm.init();
+    for (args[1..]) |arg| {
+        try vm.run(arg);
+    }
+
+    restore_input_buffering(&orig_tio);
+}
+
+fn disable_input_buffering(orig_tio: *c.termios) void {
+    const stdin_fd = std.os.linux.STDIN_FILENO;
+    _ = c.tcgetattr(stdin_fd, orig_tio);
+
+    var new_tio: c.termios = orig_tio.*;
+    new_tio.c_lflag &= @bitCast(-c.ICANON & -c.ECHO);
+    _ = c.tcsetattr(stdin_fd, c.TCSANOW, &new_tio);
+}
+
+fn restore_input_buffering(orig_tio: *const c.termios) void {
+    const stdin_fd = std.os.linux.STDIN_FILENO;
+    _ = c.tcsetattr(stdin_fd, c.TCSANOW, orig_tio);
+}
+
+fn register_sigint_handler() void {
+    const action = posix.Sigaction{
+        .handler = .{ .handler = handle_sig_int },
+        .mask = posix.empty_sigset,
+        .flags = 0,
+    };
+
+    posix.sigaction(posix.SIG.INT, &action, null);
+}
+
+fn handle_sig_int(_: c_int) callconv(.C) void {
+    std.debug.print("HALT\n", .{});
+    std.process.exit(1);
 }
 
 const std = @import("std");
+const posix = std.posix;
 
 /// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
 const lib = @import("vm_lib");
-const vm = @import("vm");
+const vm_lib = @import("vm");
 
-const Opcode = vm.Opcode;
-const Register = vm.Register;
-const Registers = vm.Registers;
+const Opcode = vm_lib.Opcode;
+const Register = vm_lib.Register;
+const Vm = vm_lib.Vm;
+
+const c = @cImport({
+    @cInclude("stdio.h");
+    @cInclude("sys/termios.h");
+    @cInclude("sys/select.h");
+});
