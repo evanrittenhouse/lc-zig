@@ -184,10 +184,10 @@ pub const Vm = struct {
 
         if ((instr >> 11) & 0x1 == 0) {
             const subroutine_base_reg = (instr >> 6) & 0x7;
-            self.reg[Register.pc()] = subroutine_base_reg;
+            self.reg[Register.pc()] = self.reg[subroutine_base_reg];
         } else {
             const new_addr = sign_extend(instr & 0x7FF, 11);
-            self.reg[Register.pc()] += new_addr;
+            self.reg[Register.pc()] = @addWithOverflow(self.reg[Register.pc()], new_addr)[0];
         }
 
         return null;
@@ -319,7 +319,7 @@ pub const Vm = struct {
             Trap.OUT.val() => self.trap_out(),
             Trap.PUTS.val() => self.trap_puts(),
             Trap.IN.val() => self.trap_in(),
-            Trap.PUTSP.val() => {},
+            Trap.PUTSP.val() => self.trap_putsp(),
             Trap.HALT.val() => self.trap_halt(),
             else => {},
         }
@@ -335,18 +335,19 @@ pub const Vm = struct {
     // Write a character in R0[7:0] to the display.
     fn trap_out(self: *Vm) void {
         const char: u8 = @truncate(self.reg[0]);
-        _ = stdout.write(&[1]u8{char}) catch unreachable;
+        stdout.print("{c}", .{char}) catch unreachable;
     }
 
     fn trap_puts(self: *Vm) void {
         var buffered_writer = std.io.bufferedWriter(stdout);
+        const out = buffered_writer.writer();
 
         // Memory address of first character is stored in R0.
         // Printing stops when we receive 0x0000 in a location.
         var addr = self.reg[0];
         while (self.mem[addr] != 0) {
             const char: u8 = @intCast(self.mem[addr]);
-            _ = buffered_writer.write(&[1]u8{char}) catch unreachable;
+            out.print("{c}", .{char}) catch unreachable;
             addr += 1;
         }
 
@@ -354,17 +355,18 @@ pub const Vm = struct {
     }
 
     fn trap_in(self: *Vm) void {
-        _ = stdout.write("Enter a character: ") catch unreachable;
+        _ = stdout.print("Enter a character: ", .{}) catch unreachable;
         const input = stdin.readByte() catch unreachable;
+        self.reg[0] = @as(u16, input);
 
-        const char = @as(u16, input);
-        self.reg[0] = char;
+        stdout.print("{c}", .{input}) catch unreachable;
     }
 
     fn trap_putsp(self: *Vm) void {
+        std.debug.print("putsp trap\n", .{});
         var buffered_writer = std.io.bufferedWriter(stdout);
-        const shifts = [2]u8{ 0, 8 };
-        const mem_addr = self.reg[0];
+        const out = buffered_writer.writer();
+        var mem_addr = self.reg[0];
 
         while (mem_addr < self.mem.len) {
             const val = self.mem[mem_addr];
@@ -372,30 +374,27 @@ pub const Vm = struct {
                 break;
             }
 
-            process_val: for (shifts) |shift| {
-                const char = (val >> shift) & 0xFF;
+            const first_char: u8 = @truncate(val);
+            out.print("{c}", .{first_char}) catch unreachable;
 
-                if (char == 0) {
-                    break :process_val;
-                }
-
-                buffered_writer.write(&[1]u8{char}) catch unreachable;
+            const second_char_long = val >> 8;
+            if (second_char_long != 0) {
+                const second_char: u8 = @truncate(second_char_long);
+                out.print("{c}", .{second_char}) catch unreachable;
             }
 
             mem_addr += 1;
         }
-
-        buffered_writer.flush() catch unreachable;
     }
 
     fn trap_halt(self: *Vm) void {
-        std.debug.print("HALT", .{});
+        stdout.print("HALT\n", .{}) catch unreachable;
         self.running = false;
     }
 
     // Update the COND register based on the number stored in index `r`.
     fn update_flags(self: *Vm, index: u16) void {
-        var value = self.reg[Register.cond()];
+        var value: u16 = undefined;
 
         if (self.reg[index] == 0) {
             value = @intFromEnum(Sign.ZRO);
@@ -404,6 +403,8 @@ pub const Vm = struct {
         } else {
             value = @intFromEnum(Sign.POS);
         }
+
+        self.reg[Register.cond()] = value;
     }
 
     fn mem_write(self: *Vm, addr: u16, val: u16) void {
@@ -459,7 +460,7 @@ fn check_keyboard() bool {
         .revents = 0,
     };
 
-    return c.poll(&pollfd, 1, -1) >= 0;
+    return c.poll(&pollfd, 1, 0) != 0;
 }
 
 pub const NUM_REGISTERS = @typeInfo(Register).@"enum".fields.len;

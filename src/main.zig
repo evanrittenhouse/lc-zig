@@ -24,14 +24,13 @@ pub fn main() !void {
 
     var orig_tio: c.termios = undefined;
     disable_input_buffering(&orig_tio);
+    defer restore_input_buffering(&orig_tio);
     register_sigint_handler();
 
     var vm = Vm.init();
     for (args[1..]) |arg| {
         try vm.run(arg);
     }
-
-    restore_input_buffering(&orig_tio);
 }
 
 fn disable_input_buffering(orig_tio: *c.termios) void {
@@ -39,7 +38,8 @@ fn disable_input_buffering(orig_tio: *c.termios) void {
     _ = c.tcgetattr(stdin_fd, orig_tio);
 
     var new_tio: c.termios = orig_tio.*;
-    new_tio.c_lflag &= @bitCast(-c.ICANON & -c.ECHO);
+    const c_lflag: c_uint = @bitCast(~c.ICANON & ~c.ECHO);
+    new_tio.c_lflag &= c_lflag;
     _ = c.tcsetattr(stdin_fd, c.TCSANOW, &new_tio);
 }
 
