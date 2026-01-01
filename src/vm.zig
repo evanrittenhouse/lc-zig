@@ -101,10 +101,10 @@ pub const Vm = struct {
         if (immediate_flag) {
             // 0x1F == 31, and imm5 is 5 bits wide
             const imm5 = sign_extend(@as(u16, instr & 0x1F), 5);
-            self.reg[dst] = @addWithOverflow(self.reg[src1], imm5)[0];
+            self.reg[dst] = self.reg[src1] +% imm5;
         } else {
             const src2 = instr & 0x7;
-            self.reg[dst] = @addWithOverflow(self.reg[src1], self.reg[src2])[0];
+            self.reg[dst] = self.reg[src1] +% self.reg[src2];
         }
 
         return dst;
@@ -145,14 +145,11 @@ pub const Vm = struct {
     // If any of the tested condition codes are set, branch to the location specified
     // by adding sign-extended PCoffset9 to the incremented PC.
     fn branch(self: *Vm, instr: u16) ?u16 {
-        const test_pos = (instr >> 11) & 0x1 == 1;
-        const test_zero = (instr >> 10) & 0x1 == 1;
-        const test_neg = (instr >> 9) & 0x1 == 1;
-
+        const cond_flags = (instr >> 0x9) & 0x7;
         const cond = self.reg[Register.cond()];
 
-        if ((test_pos and (cond & Sign.POS.val()) == 1) or (test_zero and (cond & Sign.ZRO.val()) == 1) or (test_neg and (cond & Sign.NEG.val()) == 1)) {
-            self.reg[Register.pc()] += sign_extend(@as(u16, instr & 0x1FF), 9);
+        if (cond & cond_flags >= 1) {
+            self.reg[Register.pc()] +%= sign_extend(@as(u16, instr & 0x1FF), 9);
         }
 
         return null;
@@ -187,7 +184,7 @@ pub const Vm = struct {
             self.reg[Register.pc()] = self.reg[subroutine_base_reg];
         } else {
             const new_addr = sign_extend(instr & 0x7FF, 11);
-            self.reg[Register.pc()] = @addWithOverflow(self.reg[Register.pc()], new_addr)[0];
+            self.reg[Register.pc()] +%= new_addr;
         }
 
         return null;
@@ -199,9 +196,9 @@ pub const Vm = struct {
     //  0010 |  DR  | PCoffset9 |
     fn load(self: *Vm, instr: u16) ?u16 {
         const dst = dst_register(instr);
-        const addr = @addWithOverflow(sign_extend(instr & 0x1FF, 9), self.reg[Register.pc()]);
+        const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
 
-        self.reg[dst] = self.mem_read(addr[0]);
+        self.reg[dst] = self.mem_read(addr);
 
         return dst;
     }
@@ -216,7 +213,7 @@ pub const Vm = struct {
     fn load_indirect(self: *Vm, instr: u16) ?u16 {
         const dst = dst_register(instr);
 
-        const mem_loc = @addWithOverflow(sign_extend(instr & 0x1FF, 9), self.reg[Register.pc()])[0];
+        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
         self.reg[dst] = self.mem_read(self.mem_read(mem_loc));
 
         return dst;
@@ -230,7 +227,7 @@ pub const Vm = struct {
         const dst = dst_register(instr);
         const base_reg = self.reg[(instr >> 6) & 0x7];
 
-        const addr = @addWithOverflow(sign_extend(instr & 0x3F, 6), base_reg)[0];
+        const addr = sign_extend(instr & 0x3F, 6) +% base_reg;
         self.reg[dst] = self.mem[addr];
 
         return dst;
@@ -242,9 +239,9 @@ pub const Vm = struct {
     //  1110 |  DR  | PCoffset9
     fn load_effective(self: *Vm, instr: u16) ?u16 {
         const dst = dst_register(instr);
-        const addr = @addWithOverflow(sign_extend(instr & 0x1FF, 9), self.reg[Register.pc()]);
+        const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
 
-        self.reg[dst] = addr[0];
+        self.reg[dst] = addr;
 
         return dst;
     }
@@ -269,8 +266,8 @@ pub const Vm = struct {
     //  0011 |  SR  | PCoffset9 |
     fn store(self: *Vm, instr: u16) ?u16 {
         const src = (instr >> 9) & 0x7;
-        const mem_loc = @addWithOverflow(sign_extend(instr & 0x1FF, 9), self.reg[Register.pc()]);
-        self.mem_write(mem_loc[0], self.reg[src]);
+        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+        self.mem_write(mem_loc, self.reg[src]);
 
         return null;
     }
@@ -283,9 +280,9 @@ pub const Vm = struct {
     // data in SR in stored.
     fn store_indirect(self: *Vm, instr: u16) ?u16 {
         const src = (instr >> 9) & 0x7;
-        const mem_loc = @addWithOverflow(sign_extend(instr & 0x1FF, 9), self.reg[Register.pc()]);
+        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
 
-        self.mem_write(self.mem[mem_loc[0]], self.reg[src]);
+        self.mem_write(self.mem[mem_loc], self.reg[src]);
 
         return null;
     }
@@ -301,9 +298,9 @@ pub const Vm = struct {
         const src = (instr >> 9) & 0x7;
         const base_reg = (instr >> 6) & 0x7;
 
-        const mem_loc = @addWithOverflow(sign_extend(instr & 0x3F, 6), self.reg[base_reg]);
+        const mem_loc = sign_extend(instr & 0x3F, 6) +% self.reg[base_reg];
 
-        self.mem_write(mem_loc[0], self.reg[src]);
+        self.mem_write(mem_loc, self.reg[src]);
 
         return null;
     }
@@ -460,7 +457,8 @@ fn check_keyboard() bool {
         .revents = 0,
     };
 
-    return c.poll(&pollfd, 1, 0) != 0;
+    // Blocking is fine since we need keyboard input anyway.
+    return c.poll(&pollfd, 1, 0) > 0;
 }
 
 pub const NUM_REGISTERS = @typeInfo(Register).@"enum".fields.len;

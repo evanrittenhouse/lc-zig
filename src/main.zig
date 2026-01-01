@@ -1,5 +1,4 @@
 // TODO:
-// 1. SIGINT handling doesn't work
 // 2. move traps to separate struct that takes pointers (?)
 // 3. tests
 // --------------
