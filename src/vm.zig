@@ -1,427 +1,443 @@
 pub const MEMORY_MAX = 1 << 16;
 
-const stdout = std.io.getStdOut().writer();
-const stdin = std.io.getStdIn().reader();
+// Helper function to get stdin as there's no std.io.getStdIn in this Zig version
+fn getStdIn() std.fs.File {
+    return std.fs.File{
+        .handle = if (@import("builtin").os.tag == .windows) std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch unreachable else std.posix.STDIN_FILENO,
+    };
+}
 
-pub const Vm = struct {
-    reg: [NUM_REGISTERS]u16,
-    mem: [MEMORY_MAX]u16,
-    running: bool,
+const stdin_file = getStdIn();
+const stdout_file = std.io.getStdOut();
 
-    pub fn init() Vm {
-        var reg = std.mem.zeroes([NUM_REGISTERS]u16);
-        const mem = std.mem.zeroes([MEMORY_MAX]u16);
+// VM struct fields - using @This() pattern
+reg: [NUM_REGISTERS]u16,
+mem: [MEMORY_MAX]u16,
+running: bool,
 
-        // Initialize the condition flag and program counter. Set the condition
-        // flag to 0 since it must be set to something.
-        reg[Register.cond()] = @intFromEnum(Sign.ZRO);
-        reg[Register.pc()] = 0x3000;
+pub const Vm = @This();
 
-        return Vm{ .reg = reg, .mem = mem, .running = true };
+pub fn init() Vm {
+    var reg = std.mem.zeroes([NUM_REGISTERS]u16);
+    const mem = std.mem.zeroes([MEMORY_MAX]u16);
+
+    // Initialize the condition flag and program counter. Set the condition
+    // flag to 0 since it must be set to something.
+    reg[Register.cond()] = @intFromEnum(Sign.ZRO);
+    reg[Register.pc()] = 0x3000;
+
+    return Vm{ .reg = reg, .mem = mem, .running = true };
+}
+
+pub fn run(self: *Vm, path: []const u8) !void {
+    if (!(try self.load_file(path))) {
+        std.debug.print("Couldn't load file at path: {s}\n", .{path});
+        return;
     }
 
-    pub fn run(self: *Vm, path: []const u8) !void {
-        if (!(try self.load_file(path))) {
-            std.debug.print("Couldn't load file at path: {s}\n", .{path});
-            return;
+    while (self.running) {
+        const instr = self.mem_read(self.reg[Register.pc()]);
+        self.reg[Register.pc()] += 1;
+
+        const opcode = instr >> 12;
+        // std.debug.print("instr={d}, opcode = {d}, pc={d}\n", .{ instr, opcode, self.reg[Register.pc()] });
+        const dst = switch (opcode) {
+            0b0001 => self.add(instr),
+            0b0101 => self.b_and(instr),
+            0b0000 => self.branch(instr),
+            0b1100 => self.jump(instr),
+            0b0100 => self.jump_sr(instr),
+            0b0010 => self.load(instr),
+            0b1010 => self.load_indirect(instr),
+            0b0110 => self.load_base_offset(instr),
+            0b1110 => self.load_effective(instr),
+            0b1001 => self.b_not(instr),
+            0b0011 => self.store(instr),
+            0b1011 => self.store_indirect(instr),
+            0b0111 => self.store_base_offset(instr),
+            0b1111 => self.trap(instr),
+            // Illegal opcode.
+            0b1101 => std.process.exit(1),
+            else => null,
+        };
+
+        if (dst) |register| {
+            self.update_flags(register);
         }
+    }
+}
 
-        while (self.running) {
-            const instr = self.mem_read(self.reg[Register.pc()]);
-            self.reg[Register.pc()] += 1;
+fn load_file(self: *Vm, path: []const u8) !bool {
+    const file = try std.fs.openFileAbsolute(path, .{
+        .mode = std.fs.File.OpenMode.read_only,
+    });
+    defer file.close();
 
-            const opcode = instr >> 12;
-            // std.debug.print("instr={d}, opcode = {d}, pc={d}\n", .{ instr, opcode, self.reg[Register.pc()] });
-            const dst = switch (opcode) {
-                0b0001 => self.add(instr),
-                0b0101 => self.b_and(instr),
-                0b0000 => self.branch(instr),
-                0b1100 => self.jump(instr),
-                0b0100 => self.jump_sr(instr),
-                0b0010 => self.load(instr),
-                0b1010 => self.load_indirect(instr),
-                0b0110 => self.load_base_offset(instr),
-                0b1110 => self.load_effective(instr),
-                0b1001 => self.b_not(instr),
-                0b0011 => self.store(instr),
-                0b1011 => self.store_indirect(instr),
-                0b0111 => self.store_base_offset(instr),
-                0b1111 => self.trap(instr),
-                // Illegal opcode.
-                0b1101 => std.process.exit(1),
-                else => null,
-            };
+    // Thanks to https://github.com/mdaverde/lc3vm-zig/blob/main/src/main.zig!
+    const reader = std.fs.File.reader(file);
+    const u16_max = std.math.maxInt(u16);
+    const origin = try reader.readInt(u16, .big);
+    var mem_instr_index = origin;
 
-            if (dst) |register| {
-                self.update_flags(register);
+    var i: usize = 0;
+    reading: while (mem_instr_index < u16_max) {
+        self.mem[mem_instr_index] = reader.readInt(u16, .big) catch |err| {
+            switch (err) {
+                error.EndOfStream => break :reading,
+                else => return false,
             }
-        }
+        };
+
+        i += 1;
+        mem_instr_index += 1;
     }
 
-    fn load_file(self: *Vm, path: []const u8) !bool {
-        const file = try std.fs.openFileAbsolute(path, .{
-            .mode = std.fs.File.OpenMode.read_only,
-        });
-        defer file.close();
+    return true;
+}
 
-        // Thanks to https://github.com/mdaverde/lc3vm-zig/blob/main/src/main.zig!
-        const reader = std.fs.File.reader(file);
-        const u16_max = std.math.maxInt(u16);
-        const origin = try reader.readInt(u16, .big);
-        var mem_instr_index = origin;
+// Add
+// 15-12 | 11-9 | 8-6 | 5 | 4-3 | 2-0 |
+// ----------------------------------
+//  0001 |  DR  | SR1 | 0 | 00  | SR2 | = register mode.  store sum of numbers stored in SR1 and SR2 in DR
+//  0001 |  DR  | SR1 | 1 |   imm 5   | = immediate mode. same as register mode, but second number is embedded in the instruction
+//
+// in immediate mode, the second operand is obtained by sign-extending the imm5 field to 16 bits.
+fn add(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+    const src1 = (instr >> 6) & 0x7;
+    const immediate_flag = (instr >> 5) & 0x1 == 1;
 
-        var i: usize = 0;
-        reading: while (mem_instr_index < u16_max) {
-            self.mem[mem_instr_index] = reader.readInt(u16, .big) catch |err| {
-                switch (err) {
-                    error.EndOfStream => break :reading,
-                    else => return false,
-                }
-            };
-
-            i += 1;
-            mem_instr_index += 1;
-        }
-
-        return true;
+    if (immediate_flag) {
+        // 0x1F == 31, and imm5 is 5 bits wide
+        const imm5 = sign_extend(@as(u16, instr & 0x1F), 5);
+        self.reg[dst] = self.reg[src1] +% imm5;
+    } else {
+        const src2 = instr & 0x7;
+        self.reg[dst] = self.reg[src1] +% self.reg[src2];
     }
 
-    // Add
-    // 15-12 | 11-9 | 8-6 | 5 | 4-3 | 2-0 |
-    // ----------------------------------
-    //  0001 |  DR  | SR1 | 0 | 00  | SR2 | = register mode.  store sum of numbers stored in SR1 and SR2 in DR
-    //  0001 |  DR  | SR1 | 1 |   imm 5   | = immediate mode. same as register mode, but second number is embedded in the instruction
-    //
-    // in immediate mode, the second operand is obtained by sign-extending the imm5 field to 16 bits.
-    fn add(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-        const src1 = (instr >> 6) & 0x7;
-        const immediate_flag = (instr >> 5) & 0x1 == 1;
+    return dst;
+}
 
-        if (immediate_flag) {
-            // 0x1F == 31, and imm5 is 5 bits wide
-            const imm5 = sign_extend(@as(u16, instr & 0x1F), 5);
-            self.reg[dst] = self.reg[src1] +% imm5;
+// Bitwise-AND
+// 15-12 | 11-9 | 8-6 | 5 | 4-3 | 2-0 |
+// ----------------------------------
+//  0101 |  DR  | SR1 | 0 | 00  | SR2 | = register mode.  store bitwise-AND of contents of SR1 and SR2 in DR
+//  0101 |  DR  | SR1 | 1 |   imm 5   | = immediate mode. same as register mode, but second operand is in imm5
+fn b_and(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+    const src1 = (instr >> 6) & 0x7;
+    const immediate_flag = (instr >> 5) & 0x1 == 1;
+
+    if (immediate_flag) {
+        const imm5 = sign_extend(@as(u16, instr & 0x1F), 5);
+        self.reg[dst] = self.reg[src1] & imm5;
+    } else {
+        const src2 = instr & 0x7;
+        self.reg[dst] = self.reg[src1] & self.reg[src2];
+    }
+
+    return dst;
+}
+
+// Branch
+// 15-12 | 11 | 10 | 9 |     8-0   |
+// ---------------------------------
+//  0000 | n  | z  | p | PCoffset9 |
+//
+// Check condition codes and branch.
+// If 11 is set, N is tested - if 11 is not set, N is not tested.
+// If 10 is set, Z is tested - if 10 is not set, Z is not tested.
+// EX: BRzp LOOP -> branch to LOOP if condition was zero or positive.
+// EX: BR   NEXT -> branch to NEXT, unconditionally.
+//
+// If any of the tested condition codes are set, branch to the location specified
+// by adding sign-extended PCoffset9 to the incremented PC.
+fn branch(self: *Vm, instr: u16) ?u16 {
+    const cond_flags = (instr >> 0x9) & 0x7;
+    const cond = self.reg[Register.cond()];
+
+    if (cond & cond_flags >= 1) {
+        self.reg[Register.pc()] +%= sign_extend(@as(u16, instr & 0x1FF), 9);
+    }
+
+    return null;
+}
+
+// Jump / Ret
+//  | 15-12 | 11-9 |   8-6 |  5-0  |
+//  --------------------------------
+// J: 1100  | 000  | BaseR | 00000 |
+// R: 1100  | 000  | 111   | 00000 |
+//
+// Jump: Program unconditionally jumps to the location specified by BaseR
+// Ret: Set PC to R7, which contains linkage to instruction following subroutine call
+fn jump(self: *Vm, instr: u16) ?u16 {
+    const base_register = (instr >> 6) & 0x7;
+
+    self.reg[Register.pc()] = self.reg[base_register];
+
+    return null;
+}
+
+// Jump to Subroutine
+//     | 15-12 | 11| 10-9 |  8-6|  5-0  |
+//  ---------------------------------------
+//  JSR:  0100 | 1 | PCoffset11           |
+//  JSRR: 0100 | 0 |  00  | BaseR | 00000 |
+fn jump_sr(self: *Vm, instr: u16) ?u16 {
+    self.reg[7] = self.reg[Register.pc()];
+
+    if ((instr >> 11) & 0x1 == 0) {
+        const subroutine_base_reg = (instr >> 6) & 0x7;
+        self.reg[Register.pc()] = self.reg[subroutine_base_reg];
+    } else {
+        const new_addr = sign_extend(instr & 0x7FF, 11);
+        self.reg[Register.pc()] +%= new_addr;
+    }
+
+    return null;
+}
+
+// Load
+// 15-12 | 11-9 |    8-0    |
+// --------------------------
+//  0010 |  DR  | PCoffset9 |
+fn load(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+    const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+
+    self.reg[dst] = self.mem_read(addr);
+
+    return dst;
+}
+
+// LDI
+// 15-12 | 11-9 |    8-0  |
+// ------------------------
+//  1010 |  DR  | PCoffset9
+//
+// An address is computed by sign-extending PCoffset9 and adding this value to the incremented PC.
+// The value at this address is loaded into DR.
+fn load_indirect(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+
+    const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+    self.reg[dst] = self.mem_read(self.mem_read(mem_loc));
+
+    return dst;
+}
+
+// Load Base + offset
+// 15-12 | 11-9 | 8-6 |   5-0   |
+// ------------------------------
+//  0110 |  DR  |BaseR| offset6 |
+fn load_base_offset(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+    const base_reg = self.reg[(instr >> 6) & 0x7];
+
+    const addr = sign_extend(instr & 0x3F, 6) +% base_reg;
+    self.reg[dst] = self.mem[addr];
+
+    return dst;
+}
+
+// Load effective address
+// 15-12 | 11-9 |    8-0  |
+// ------------------------
+//  1110 |  DR  | PCoffset9
+fn load_effective(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+    const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+
+    self.reg[dst] = addr;
+
+    return dst;
+}
+
+// Not
+// 15-12 | 11-9 | 8-6 | 5 | 4-0  |
+// -------------------------------
+//  1001 |  DR  | SRC | 1 | 1111 |
+//  Bitwise-complement of contents of SRC are stored in DR
+fn b_not(self: *Vm, instr: u16) ?u16 {
+    const dst = dst_register(instr);
+
+    const src = (instr >> 6) & 0x7;
+    self.reg[dst] = ~self.reg[src];
+
+    return dst;
+}
+
+// Store
+// 15-12 | 11-9 |    8-0    |
+// -------------------------------
+//  0011 |  SR  | PCoffset9 |
+fn store(self: *Vm, instr: u16) ?u16 {
+    const src = (instr >> 9) & 0x7;
+    const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+    self.mem_write(mem_loc, self.reg[src]);
+
+    return null;
+}
+
+// Store indirect
+// 15-12 | 11-9 |    8-0    |
+// -------------------------------
+//  1011 |  SR  | PCoffset9 |
+// What is in memory at this address is the address of the location to which the
+// data in SR in stored.
+fn store_indirect(self: *Vm, instr: u16) ?u16 {
+    const src = (instr >> 9) & 0x7;
+    const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
+
+    self.mem_write(self.mem[mem_loc], self.reg[src]);
+
+    return null;
+}
+
+// Store Base + offset
+// 15-12 | 11-9 |  8-6  |   5-0   |
+// -------------------------------
+//  0111 |  SR  | BaseR | offset6 |
+// The contents of the register specified by SR are stored in the memory location
+// whose address is computed by sign-extending bits [5:0] to 16 bits and adding this
+// value to the contents of the register specified by bits [8:6].
+fn store_base_offset(self: *Vm, instr: u16) ?u16 {
+    const src = (instr >> 9) & 0x7;
+    const base_reg = (instr >> 6) & 0x7;
+
+    const mem_loc = sign_extend(instr & 0x3F, 6) +% self.reg[base_reg];
+
+    self.mem_write(mem_loc, self.reg[src]);
+
+    return null;
+}
+
+// Trap
+// 15-12 | 11-8 |    7-0    |
+//  1111 | 0000 | trapvect8 |
+fn trap(self: *Vm, instr: u16) ?u16 {
+    self.reg[7] = self.reg[Register.pc()];
+
+    switch (instr & 0xFF) {
+        Trap.GETC.val() => self.trap_getc(),
+        Trap.OUT.val() => self.trap_out(),
+        Trap.PUTS.val() => self.trap_puts(),
+        Trap.IN.val() => self.trap_in(),
+        Trap.PUTSP.val() => self.trap_putsp(),
+        Trap.HALT.val() => self.trap_halt(),
+        else => {},
+    }
+
+    return null;
+}
+
+fn trap_getc(self: *Vm) void {
+    var buf: [1]u8 = undefined;
+    const bytes_read = stdin_file.read(&buf) catch unreachable;
+    const char = if (bytes_read > 0) buf[0] else 0;
+    self.reg[0] = @as(u16, char);
+}
+
+// Write a character in R0[7:0] to the display.
+fn trap_out(self: *Vm) void {
+    const char: u8 = @truncate(self.reg[0]);
+    stdout_file.writer().print("{c}", .{char}) catch unreachable;
+}
+
+fn trap_puts(self: *Vm) void {
+    var buffered_writer = std.io.bufferedWriter(stdout_file.writer());
+    const out = buffered_writer.writer();
+
+    // Memory address of first character is stored in R0.
+    // Printing stops when we receive 0x0000 in a location.
+    var addr = self.reg[0];
+    while (self.mem[addr] != 0) {
+        const char: u8 = @intCast(self.mem[addr]);
+        out.print("{c}", .{char}) catch unreachable;
+        addr += 1;
+    }
+
+    buffered_writer.flush() catch unreachable;
+}
+
+fn trap_in(self: *Vm) void {
+    const stdout_writer = stdout_file.writer();
+    _ = stdout_writer.print("Enter a character: ", .{}) catch unreachable;
+    var buf: [1]u8 = undefined;
+    const bytes_read = stdin_file.read(&buf) catch unreachable;
+    const input = if (bytes_read > 0) buf[0] else 0;
+    self.reg[0] = @as(u16, input);
+
+    stdout_writer.print("{c}", .{input}) catch unreachable;
+}
+
+fn trap_putsp(self: *Vm) void {
+    std.debug.print("putsp trap\n", .{});
+    var buffered_writer = std.io.bufferedWriter(stdout_file.writer());
+    const out = buffered_writer.writer();
+    var mem_addr = self.reg[0];
+
+    while (mem_addr < self.mem.len) {
+        const val = self.mem[mem_addr];
+        if (val == 0) {
+            break;
+        }
+
+        const first_char: u8 = @truncate(val);
+        out.print("{c}", .{first_char}) catch unreachable;
+
+        const second_char_long = val >> 8;
+        if (second_char_long != 0) {
+            const second_char: u8 = @truncate(second_char_long);
+            out.print("{c}", .{second_char}) catch unreachable;
+        }
+
+        mem_addr += 1;
+    }
+}
+
+fn trap_halt(self: *Vm) void {
+    stdout_file.writer().print("HALT\n", .{}) catch unreachable;
+    self.running = false;
+}
+
+// Update the COND register based on the number stored in index `r`.
+fn update_flags(self: *Vm, index: u16) void {
+    var value: u16 = undefined;
+
+    if (self.reg[index] == 0) {
+        value = @intFromEnum(Sign.ZRO);
+    } else if (((self.reg[index] >> 15) & 0x1) == 1) {
+        value = @intFromEnum(Sign.NEG);
+    } else {
+        value = @intFromEnum(Sign.POS);
+    }
+
+    self.reg[Register.cond()] = value;
+}
+
+fn mem_write(self: *Vm, addr: u16, val: u16) void {
+    self.mem[addr] = val;
+}
+
+// TODO: read about MemMappedRegisters and how they work.
+fn mem_read(self: *Vm, addr: u16) u16 {
+    if (addr == MemMappedRegisters.KeyboardStatus.val()) {
+        if (check_keyboard()) {
+            self.mem[MemMappedRegisters.KeyboardStatus.val()] = (1 << 15);
+            var buf: [1]u8 = undefined;
+            const bytes_read = stdin_file.read(&buf) catch unreachable;
+            const char = if (bytes_read > 0) buf[0] else 0;
+            self.mem[MemMappedRegisters.KeyboardData.val()] = @as(u16, char);
         } else {
-            const src2 = instr & 0x7;
-            self.reg[dst] = self.reg[src1] +% self.reg[src2];
-        }
-
-        return dst;
-    }
-
-    // Bitwise-AND
-    // 15-12 | 11-9 | 8-6 | 5 | 4-3 | 2-0 |
-    // ----------------------------------
-    //  0101 |  DR  | SR1 | 0 | 00  | SR2 | = register mode.  store bitwise-AND of contents of SR1 and SR2 in DR
-    //  0101 |  DR  | SR1 | 1 |   imm 5   | = immediate mode. same as register mode, but second operand is in imm5
-    fn b_and(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-        const src1 = (instr >> 6) & 0x7;
-        const immediate_flag = (instr >> 5) & 0x1 == 1;
-
-        if (immediate_flag) {
-            const imm5 = sign_extend(@as(u16, instr & 0x1F), 5);
-            self.reg[dst] = self.reg[src1] & imm5;
-        } else {
-            const src2 = instr & 0x7;
-            self.reg[dst] = self.reg[src1] & self.reg[src2];
-        }
-
-        return dst;
-    }
-
-    // Branch
-    // 15-12 | 11 | 10 | 9 |     8-0   |
-    // ---------------------------------
-    //  0000 | n  | z  | p | PCoffset9 |
-    //
-    // Check condition codes and branch.
-    // If 11 is set, N is tested - if 11 is not set, N is not tested.
-    // If 10 is set, Z is tested - if 10 is not set, Z is not tested.
-    // EX: BRzp LOOP -> branch to LOOP if condition was zero or positive.
-    // EX: BR   NEXT -> branch to NEXT, unconditionally.
-    //
-    // If any of the tested condition codes are set, branch to the location specified
-    // by adding sign-extended PCoffset9 to the incremented PC.
-    fn branch(self: *Vm, instr: u16) ?u16 {
-        const cond_flags = (instr >> 0x9) & 0x7;
-        const cond = self.reg[Register.cond()];
-
-        if (cond & cond_flags >= 1) {
-            self.reg[Register.pc()] +%= sign_extend(@as(u16, instr & 0x1FF), 9);
-        }
-
-        return null;
-    }
-
-    // Jump / Ret
-    //  | 15-12 | 11-9 |   8-6 |  5-0  |
-    //  --------------------------------
-    // J: 1100  | 000  | BaseR | 00000 |
-    // R: 1100  | 000  | 111   | 00000 |
-    //
-    // Jump: Program unconditionally jumps to the location specified by BaseR
-    // Ret: Set PC to R7, which contains linkage to instruction following subroutine call
-    fn jump(self: *Vm, instr: u16) ?u16 {
-        const base_register = (instr >> 6) & 0x7;
-
-        self.reg[Register.pc()] = self.reg[base_register];
-
-        return null;
-    }
-
-    // Jump to Subroutine
-    //     | 15-12 | 11| 10-9 |  8-6|  5-0  |
-    //  ---------------------------------------
-    //  JSR:  0100 | 1 | PCoffset11           |
-    //  JSRR: 0100 | 0 |  00  | BaseR | 00000 |
-    fn jump_sr(self: *Vm, instr: u16) ?u16 {
-        self.reg[7] = self.reg[Register.pc()];
-
-        if ((instr >> 11) & 0x1 == 0) {
-            const subroutine_base_reg = (instr >> 6) & 0x7;
-            self.reg[Register.pc()] = self.reg[subroutine_base_reg];
-        } else {
-            const new_addr = sign_extend(instr & 0x7FF, 11);
-            self.reg[Register.pc()] +%= new_addr;
-        }
-
-        return null;
-    }
-
-    // Load
-    // 15-12 | 11-9 |    8-0    |
-    // --------------------------
-    //  0010 |  DR  | PCoffset9 |
-    fn load(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-        const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
-
-        self.reg[dst] = self.mem_read(addr);
-
-        return dst;
-    }
-
-    // LDI
-    // 15-12 | 11-9 |    8-0  |
-    // ------------------------
-    //  1010 |  DR  | PCoffset9
-    //
-    // An address is computed by sign-extending PCoffset9 and adding this value to the incremented PC.
-    // The value at this address is loaded into DR.
-    fn load_indirect(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-
-        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
-        self.reg[dst] = self.mem_read(self.mem_read(mem_loc));
-
-        return dst;
-    }
-
-    // Load Base + offset
-    // 15-12 | 11-9 | 8-6 |   5-0   |
-    // ------------------------------
-    //  0110 |  DR  |BaseR| offset6 |
-    fn load_base_offset(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-        const base_reg = self.reg[(instr >> 6) & 0x7];
-
-        const addr = sign_extend(instr & 0x3F, 6) +% base_reg;
-        self.reg[dst] = self.mem[addr];
-
-        return dst;
-    }
-
-    // Load effective address
-    // 15-12 | 11-9 |    8-0  |
-    // ------------------------
-    //  1110 |  DR  | PCoffset9
-    fn load_effective(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-        const addr = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
-
-        self.reg[dst] = addr;
-
-        return dst;
-    }
-
-    // Not
-    // 15-12 | 11-9 | 8-6 | 5 | 4-0  |
-    // -------------------------------
-    //  1001 |  DR  | SRC | 1 | 1111 |
-    //  Bitwise-complement of contents of SRC are stored in DR
-    fn b_not(self: *Vm, instr: u16) ?u16 {
-        const dst = dst_register(instr);
-
-        const src = (instr >> 6) & 0x7;
-        self.reg[dst] = ~self.reg[src];
-
-        return dst;
-    }
-
-    // Store
-    // 15-12 | 11-9 |    8-0    |
-    // -------------------------------
-    //  0011 |  SR  | PCoffset9 |
-    fn store(self: *Vm, instr: u16) ?u16 {
-        const src = (instr >> 9) & 0x7;
-        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
-        self.mem_write(mem_loc, self.reg[src]);
-
-        return null;
-    }
-
-    // Store indirect
-    // 15-12 | 11-9 |    8-0    |
-    // -------------------------------
-    //  1011 |  SR  | PCoffset9 |
-    // What is in memory at this address is the address of the location to which the
-    // data in SR in stored.
-    fn store_indirect(self: *Vm, instr: u16) ?u16 {
-        const src = (instr >> 9) & 0x7;
-        const mem_loc = sign_extend(instr & 0x1FF, 9) +% self.reg[Register.pc()];
-
-        self.mem_write(self.mem[mem_loc], self.reg[src]);
-
-        return null;
-    }
-
-    // Store Base + offset
-    // 15-12 | 11-9 |  8-6  |   5-0   |
-    // -------------------------------
-    //  0111 |  SR  | BaseR | offset6 |
-    // The contents of the register specified by SR are stored in the memory location
-    // whose address is computed by sign-extending bits [5:0] to 16 bits and adding this
-    // value to the contents of the register specified by bits [8:6].
-    fn store_base_offset(self: *Vm, instr: u16) ?u16 {
-        const src = (instr >> 9) & 0x7;
-        const base_reg = (instr >> 6) & 0x7;
-
-        const mem_loc = sign_extend(instr & 0x3F, 6) +% self.reg[base_reg];
-
-        self.mem_write(mem_loc, self.reg[src]);
-
-        return null;
-    }
-
-    // Trap
-    // 15-12 | 11-8 |    7-0    |
-    //  1111 | 0000 | trapvect8 |
-    fn trap(self: *Vm, instr: u16) ?u16 {
-        self.reg[7] = self.reg[Register.pc()];
-
-        switch (instr & 0xFF) {
-            Trap.GETC.val() => self.trap_getc(),
-            Trap.OUT.val() => self.trap_out(),
-            Trap.PUTS.val() => self.trap_puts(),
-            Trap.IN.val() => self.trap_in(),
-            Trap.PUTSP.val() => self.trap_putsp(),
-            Trap.HALT.val() => self.trap_halt(),
-            else => {},
-        }
-
-        return null;
-    }
-
-    fn trap_getc(self: *Vm) void {
-        const char = std.io.getStdIn().reader().readByte() catch unreachable;
-        self.reg[0] = @as(u16, char);
-    }
-
-    // Write a character in R0[7:0] to the display.
-    fn trap_out(self: *Vm) void {
-        const char: u8 = @truncate(self.reg[0]);
-        stdout.print("{c}", .{char}) catch unreachable;
-    }
-
-    fn trap_puts(self: *Vm) void {
-        var buffered_writer = std.io.bufferedWriter(stdout);
-        const out = buffered_writer.writer();
-
-        // Memory address of first character is stored in R0.
-        // Printing stops when we receive 0x0000 in a location.
-        var addr = self.reg[0];
-        while (self.mem[addr] != 0) {
-            const char: u8 = @intCast(self.mem[addr]);
-            out.print("{c}", .{char}) catch unreachable;
-            addr += 1;
-        }
-
-        buffered_writer.flush() catch unreachable;
-    }
-
-    fn trap_in(self: *Vm) void {
-        _ = stdout.print("Enter a character: ", .{}) catch unreachable;
-        const input = stdin.readByte() catch unreachable;
-        self.reg[0] = @as(u16, input);
-
-        stdout.print("{c}", .{input}) catch unreachable;
-    }
-
-    fn trap_putsp(self: *Vm) void {
-        std.debug.print("putsp trap\n", .{});
-        var buffered_writer = std.io.bufferedWriter(stdout);
-        const out = buffered_writer.writer();
-        var mem_addr = self.reg[0];
-
-        while (mem_addr < self.mem.len) {
-            const val = self.mem[mem_addr];
-            if (val == 0) {
-                break;
-            }
-
-            const first_char: u8 = @truncate(val);
-            out.print("{c}", .{first_char}) catch unreachable;
-
-            const second_char_long = val >> 8;
-            if (second_char_long != 0) {
-                const second_char: u8 = @truncate(second_char_long);
-                out.print("{c}", .{second_char}) catch unreachable;
-            }
-
-            mem_addr += 1;
+            self.mem[MemMappedRegisters.KeyboardStatus.val()] = 0;
         }
     }
 
-    fn trap_halt(self: *Vm) void {
-        stdout.print("HALT\n", .{}) catch unreachable;
-        self.running = false;
-    }
-
-    // Update the COND register based on the number stored in index `r`.
-    fn update_flags(self: *Vm, index: u16) void {
-        var value: u16 = undefined;
-
-        if (self.reg[index] == 0) {
-            value = @intFromEnum(Sign.ZRO);
-        } else if (((self.reg[index] >> 15) & 0x1) == 1) {
-            value = @intFromEnum(Sign.NEG);
-        } else {
-            value = @intFromEnum(Sign.POS);
-        }
-
-        self.reg[Register.cond()] = value;
-    }
-
-    fn mem_write(self: *Vm, addr: u16, val: u16) void {
-        self.mem[addr] = val;
-    }
-
-    // TODO: read about MemMappedRegisters and how they work.
-    fn mem_read(self: *Vm, addr: u16) u16 {
-        if (addr == MemMappedRegisters.KeyboardStatus.val()) {
-            if (check_keyboard()) {
-                self.mem[MemMappedRegisters.KeyboardStatus.val()] = (1 << 15);
-                self.mem[MemMappedRegisters.KeyboardData.val()] = @as(u16, std.io.getStdIn().reader().readByte() catch unreachable);
-            } else {
-                self.mem[MemMappedRegisters.KeyboardStatus.val()] = 0;
-            }
-        }
-
-        return self.mem[addr];
-    }
-};
+    return self.mem[addr];
+}
 
 // imm5 is only 5 bits, but has to be added to a 16-bit number.
 //
@@ -451,14 +467,21 @@ inline fn dst_register(instr: u16) u16 {
 }
 
 fn check_keyboard() bool {
-    var pollfd = c.pollfd{
-        .fd = std.os.linux.STDIN_FILENO,
-        .events = c.POLLIN,
-        .revents = 0,
-    };
+    // Platform-specific keyboard checking
+    if (@import("builtin").os.tag == .windows) {
+        // Windows doesn't support poll, use different approach if needed
+        // For now, return false to avoid keyboard checking on Windows
+        return false;
+    } else {
+        // Unix-like systems (Linux, macOS, etc.) support poll
+        var pollfd = c.pollfd{
+            .fd = std.posix.STDIN_FILENO,
+            .events = c.POLLIN,
+            .revents = 0,
+        };
 
-    // Blocking is fine since we need keyboard input anyway.
-    return c.poll(&pollfd, 1, 0) > 0;
+        return c.poll(&pollfd, 1, 0) > 0;
+    }
 }
 
 pub const NUM_REGISTERS = @typeInfo(Register).@"enum".fields.len;
@@ -600,8 +623,53 @@ test "b_not" {
     try expect(reg.reg[1] == 0);
 }
 
-test "branch" {
-    // TODO
+test "branch_positive" {
+    var vm = Vm.init();
+    vm.reg[Register.cond()] = @intFromEnum(Sign.POS);
+    const initial_pc = vm.reg[Register.pc()];
+
+    // BRp with offset 5: 0000_0_0_1_000000101 (bit 9 = p)
+    _ = vm.branch(0b0000_001_000000101);
+    try expect(vm.reg[Register.pc()] == initial_pc + 5);
+}
+
+test "branch_zero" {
+    var vm = Vm.init();
+    vm.reg[Register.cond()] = @intFromEnum(Sign.ZRO);
+    const initial_pc = vm.reg[Register.pc()];
+
+    // BRz with offset 3: 0000_0_1_0_000000011
+    _ = vm.branch(0b0000_010_000000011);
+    try expect(vm.reg[Register.pc()] == initial_pc + 3);
+}
+
+test "branch_negative" {
+    var vm = Vm.init();
+    vm.reg[Register.cond()] = @intFromEnum(Sign.NEG);
+    const initial_pc = vm.reg[Register.pc()];
+
+    // BRn with offset 2: 0000_1_0_0_000000010 (bit 11 = n)
+    _ = vm.branch(0b0000_100_000000010);
+    try expect(vm.reg[Register.pc()] == initial_pc + 2);
+}
+
+test "branch_not_taken" {
+    var vm = Vm.init();
+    vm.reg[Register.cond()] = @intFromEnum(Sign.POS);
+    const initial_pc = vm.reg[Register.pc()];
+
+    // BRz (test zero) but condition is positive, so no branch
+    _ = vm.branch(0b0000_010_000000101);
+    try expect(vm.reg[Register.pc()] == initial_pc);
+}
+
+test "branch_unconditional" {
+    var vm = Vm.init();
+    const initial_pc = vm.reg[Register.pc()];
+
+    // BR (all flags set) with offset 10: 0000_1_1_1_000001010
+    _ = vm.branch(0b0000_111_000001010);
+    try expect(vm.reg[Register.pc()] == initial_pc + 10);
 }
 
 test "jump" {
@@ -620,4 +688,152 @@ test "ret" {
     const ret = reg.jump(0b1100_000_111_000000);
     try expect(ret == null);
     try expect(reg.reg[Register.pc()] == 1);
+}
+
+test "jump_sr_jsr" {
+    var vm = Vm.init();
+    const initial_pc = vm.reg[Register.pc()];
+
+    // JSR with offset 4: 0100_1_00000000100 (bit 11=1 for JSR, offset=4)
+    _ = vm.jump_sr(0b0100_100000000100);
+    try expect(vm.reg[7] == initial_pc); // R7 stores return address
+    try expect(vm.reg[Register.pc()] == initial_pc + 4);
+}
+
+test "jump_sr_jsrr" {
+    var vm = Vm.init();
+    const initial_pc = vm.reg[Register.pc()];
+    vm.reg[2] = 0x4000; // Set base register to jump target
+
+    // JSRR with BaseR=2: 0100_0_00_010_000000
+    _ = vm.jump_sr(0b0100_000_010_000000);
+    try expect(vm.reg[7] == initial_pc); // R7 stores return address
+    try expect(vm.reg[Register.pc()] == 0x4000);
+}
+
+test "load" {
+    var vm = Vm.init();
+    const pc = vm.reg[Register.pc()];
+
+    // Set up memory with a value to load
+    vm.mem[pc + 5] = 42;
+
+    // LD R1, 5: 0010_001_000000101
+    _ = vm.load(0b0010_001_000000101);
+    try expect(vm.reg[1] == 42);
+}
+
+test "load_indirect" {
+    var vm = Vm.init();
+    const pc = vm.reg[Register.pc()];
+
+    // Set up two-level indirection
+    vm.mem[pc + 3] = 0x4000; // Address at PC+3 points to 0x4000
+    vm.mem[0x4000] = 99; // Value at 0x4000 is 99
+
+    // LDI R2, 3: 1010_010_000000011
+    _ = vm.load_indirect(0b1010_010_000000011);
+    try expect(vm.reg[2] == 99);
+}
+
+test "load_base_offset" {
+    var vm = Vm.init();
+
+    // Set base register and memory
+    vm.reg[3] = 0x3000;
+    vm.mem[0x3005] = 123;
+
+    // LDR R1, R3, 5: 0110_001_011_000101
+    _ = vm.load_base_offset(0b0110_001_011_000101);
+    try expect(vm.reg[1] == 123);
+}
+
+test "load_effective" {
+    var vm = Vm.init();
+    const pc = vm.reg[Register.pc()];
+
+    // LEA R4, 10: 1110_100_000001010
+    _ = vm.load_effective(0b1110_100_000001010);
+    try expect(vm.reg[4] == pc + 10);
+}
+
+test "store" {
+    var vm = Vm.init();
+    const pc = vm.reg[Register.pc()];
+    vm.reg[2] = 77;
+
+    // ST R2, 8: 0011_010_000001000
+    _ = vm.store(0b0011_010_000001000);
+    try expect(vm.mem[pc + 8] == 77);
+}
+
+test "store_indirect" {
+    var vm = Vm.init();
+    const pc = vm.reg[Register.pc()];
+    vm.reg[3] = 55;
+
+    // Set up indirection: memory at PC+4 contains address 0x4000
+    vm.mem[pc + 4] = 0x4000;
+
+    // STI R3, 4: 1011_011_000000100
+    _ = vm.store_indirect(0b1011_011_000000100);
+    try expect(vm.mem[0x4000] == 55);
+}
+
+test "store_base_offset" {
+    var vm = Vm.init();
+    vm.reg[1] = 88; // Value to store
+    vm.reg[4] = 0x3000; // Base register
+
+    // STR R1, R4, 7: 0111_001_100_000111
+    _ = vm.store_base_offset(0b0111_001_100_000111);
+    try expect(vm.mem[0x3007] == 88);
+}
+
+test "update_flags_positive" {
+    var vm = Vm.init();
+    vm.reg[0] = 5; // Positive value
+
+    vm.update_flags(0);
+    try expect(vm.reg[Register.cond()] == @intFromEnum(Sign.POS));
+}
+
+test "update_flags_zero" {
+    var vm = Vm.init();
+    vm.reg[1] = 0; // Zero value
+
+    vm.update_flags(1);
+    try expect(vm.reg[Register.cond()] == @intFromEnum(Sign.ZRO));
+}
+
+test "update_flags_negative" {
+    var vm = Vm.init();
+    vm.reg[2] = 0x8000; // Negative value (MSB is 1)
+
+    vm.update_flags(2);
+    try expect(vm.reg[Register.cond()] == @intFromEnum(Sign.NEG));
+}
+
+test "sign_extend_positive" {
+    // Positive 5-bit number: 00101 = 5
+    const result = sign_extend(0b00101, 5);
+    try expect(result == 5);
+}
+
+test "sign_extend_negative" {
+    // Negative 5-bit number: 11111 = -1 in two's complement
+    const result = sign_extend(0b11111, 5);
+    try expect(result == 0xFFFF); // -1 extended to 16 bits
+}
+
+test "sign_extend_9bit_positive" {
+    // Positive 9-bit number: 000001010 = 10
+    const result = sign_extend(0b000001010, 9);
+    try expect(result == 10);
+}
+
+test "sign_extend_9bit_negative" {
+    // Negative 9-bit number: 111111110 = -2 in two's complement
+    const result = sign_extend(0b111111110, 9);
+    try expect(result == 0xFFFE); // -2 extended to 16 bits
 }
